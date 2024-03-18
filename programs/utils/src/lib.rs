@@ -2,17 +2,17 @@ use anchor_lang::prelude::*;
 pub mod utils;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+use anchor_spl::token_interface::{transfer_checked, TransferChecked};
 use crate::utils::resize_account;
 mod errors;
 
 // This is your program's public key and it will update
 // automatically when you build the project.
-declare_id!("2jWG6JY5EuDjFu3KHuJt4BHr433B6e8FV1LtQGXZgNqF");
+declare_id!("HGAdGX6gadNCmKdMR949QHM5YtHYnkzKBAmua9FoLpvY");
 
 pub const STAKE_POOL_PREFIX: &str = "stake-pool";
 pub const STAKE_POOL_DEFAULT_SIZE: usize = 8 + 1 + 32 + 16 + 16 + 32 + 16 + 16 + 32 + 1 + 24 + 24;
 pub const STAKE_ENTRY_PREFIX: &str = "stake-entry";
-pub const STAKE_ENTRY_SIZE: usize = 8 + std::mem::size_of::<StakeEntry>() + 8;
 
 #[program]
 mod dyme_staking {
@@ -78,6 +78,11 @@ mod dyme_staking {
             return Err(errors::ErrorCode::StakePoolHasEnded.into());
         }
 
+        let decimals_str = format!(
+            "1{}",
+            "0".repeat(stake_pool.default_multiplier.try_into().unwrap())
+        ); // Concatenating "1" with "0" repeated `number` times
+        let decimals: u64 = decimals_str.parse().expect("Failed to parse string to u64");
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.payer_token_account.to_account_info(),
@@ -87,13 +92,61 @@ mod dyme_staking {
         let cpi_program = ctx.accounts.token_program.to_account_info();
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
 
-        token::transfer(cpi_ctx, ix.amount)?;
+        token::transfer(cpi_ctx, ix.amount * decimals)?;
 
         stake_entry.last_staker = ctx.accounts.payer.key();
         stake_entry.last_staked_at = Clock::get().unwrap().unix_timestamp;
         stake_entry.amount = stake_entry.amount.checked_add(ix.amount).unwrap();
+        stake_entry.amount = 0;
         stake_entry.min_stake_seconds = ix.min_stake_seconds;
         stake_pool.total_staked = stake_pool.total_staked.checked_add(1).expect("Add error");
+        Ok(())
+    }
+
+    pub fn unstake_token(ctx: Context<UnstakeCtx>, ix: UnstakeIx) -> Result<()> {
+        let stake_entry = &mut ctx.accounts.stake_entry;
+        let pool = &ctx.accounts.stake_pool.key();
+        let stake_pool = &mut ctx.accounts.stake_pool;
+        let payer = &ctx.accounts.payer.key();
+        let stake_mint = &ctx.accounts.stake_mint.key();
+
+        let decimals_str = format!(
+            "1{}",
+            "0".repeat(stake_pool.default_multiplier.try_into().unwrap())
+        ); // Concatenating "1" with "0" repeated `number` times
+        let decimals: u64 = decimals_str.parse().expect("Failed to parse string to u64");
+
+        let accounts = TransferChecked {
+            from: ctx.accounts.entry_token_account.to_account_info(),
+            to: ctx.accounts.payer_token_account.to_account_info(),
+            authority: stake_entry.to_account_info(),
+            mint: ctx.accounts.stake_mint.to_account_info(),
+        };
+
+        let seeds = &[
+            STAKE_ENTRY_PREFIX.as_bytes(),
+            pool.as_ref(),
+            stake_mint.as_ref(),
+            payer.as_ref(),
+            &[stake_entry.bump],
+        ];
+
+        let signer_seeds = &[&seeds[..]];
+
+        let ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            accounts,
+            signer_seeds,
+        );
+
+        transfer_checked(
+            ctx,
+            ix.amount * decimals,
+            stake_pool.default_multiplier as u8,
+        )?;
+
+        stake_entry.amount = stake_entry.amount - ix.amount;
+        stake_pool.total_staked = stake_pool.total_staked.checked_sub(1).expect("Sub error");
         Ok(())
     }
 
@@ -148,8 +201,8 @@ pub struct InitEntryCtx<'info> {
     #[account(
         init,
         payer = payer,
-        space = STAKE_ENTRY_SIZE,
-        seeds = [STAKE_ENTRY_PREFIX.as_bytes(), stake_pool.key().as_ref(), stake_mint.key().as_ref()],
+        space = 126,
+        seeds = [STAKE_ENTRY_PREFIX.as_bytes(), stake_pool.key().as_ref(), stake_mint.key().as_ref(), payer.key().as_ref()],
         bump,
     )]
     stake_entry: Box<Account<'info, StakeEntry>>,
@@ -163,13 +216,13 @@ pub struct InitEntryCtx<'info> {
     )]
     entry_token_account: Account<'info, TokenAccount>,
     stake_mint: Box<Account<'info, Mint>>,
-    token_program: Program<'info, Token>,
-    associated_token_program: Program<'info, AssociatedToken>,
-    rent: Sysvar<'info, Rent>,
 
     #[account(mut)]
     payer: Signer<'info>,
+    token_program: Program<'info, Token>,
     system_program: Program<'info, System>,
+    associated_token_program: Program<'info, AssociatedToken>,
+    rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
@@ -189,6 +242,23 @@ pub struct InitStakeCtx<'info> {
     associated_token_program: Program<'info, AssociatedToken>,
     rent: Sysvar<'info, Rent>,
 
+    #[account(mut)]
+    payer: Signer<'info>,
+    system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UnstakeCtx<'info> {
+    #[account(mut)]
+    stake_entry: Box<Account<'info, StakeEntry>>,
+    #[account(mut)]
+    stake_pool: Box<Account<'info, StakePool>>,
+    #[account(mut)]
+    entry_token_account: Account<'info, TokenAccount>,
+    stake_mint: Box<Account<'info, Mint>>,
+    #[account(mut)]
+    payer_token_account: Account<'info, TokenAccount>,
+    token_program: Program<'info, Token>,
     #[account(mut)]
     payer: Signer<'info>,
     system_program: Program<'info, System>,
@@ -235,10 +305,15 @@ pub struct StakeEntry {
     pub min_stake_seconds: Option<u32>,
 }
 
-#[account]
+#[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct InitStakeIx {
     pub amount: u64,
     pub min_stake_seconds: Option<u32>,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize)]
+pub struct UnstakeIx {
+    pub amount: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
