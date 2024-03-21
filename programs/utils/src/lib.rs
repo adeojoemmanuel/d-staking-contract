@@ -8,7 +8,7 @@ mod errors;
 
 // This is your program's public key and it will update
 // automatically when you build the project.
-declare_id!("HGAdGX6gadNCmKdMR949QHM5YtHYnkzKBAmua9FoLpvY");
+declare_id!("6rbcJVHa32dKfw8kF1F1quSravjCLxpcjyuEqw7rP2Gc");
 
 pub const STAKE_POOL_PREFIX: &str = "stake-pool";
 pub const STAKE_POOL_DEFAULT_SIZE: usize = 8 + 1 + 32 + 16 + 16 + 32 + 16 + 16 + 32 + 1 + 24 + 24;
@@ -24,7 +24,6 @@ mod dyme_staking {
             bump,
             authority: ix.authority,
             total_staked: 0,
-            // min_stake_seconds: ix.min_stake_seconds,
             token_address: ix.token_address,
             apr: ix.apr,
             end_date: ix.end_date,
@@ -78,11 +77,9 @@ mod dyme_staking {
             return Err(errors::ErrorCode::StakePoolHasEnded.into());
         }
 
-        let decimals_str = format!(
-            "1{}",
-            "0".repeat(stake_pool.default_multiplier.try_into().unwrap())
-        ); // Concatenating "1" with "0" repeated `number` times
-        let decimals: u64 = decimals_str.parse().expect("Failed to parse string to u64");
+        if stake_entry.amount > 0 {
+            return Err(errors::ErrorCode::UnstakeAllTokens.into());
+        }
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.payer_token_account.to_account_info(),
@@ -92,12 +89,12 @@ mod dyme_staking {
         let cpi_program = ctx.accounts.token_program.to_account_info();
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
 
-        token::transfer(cpi_ctx, ix.amount * decimals)?;
+        token::transfer(cpi_ctx, ix.amount)?;
 
+        stake_entry.apr = ix.apr;
         stake_entry.last_staker = ctx.accounts.payer.key();
         stake_entry.last_staked_at = Clock::get().unwrap().unix_timestamp;
         stake_entry.amount = stake_entry.amount.checked_add(ix.amount).unwrap();
-        stake_entry.amount = 0;
         stake_entry.min_stake_seconds = ix.min_stake_seconds;
         stake_pool.total_staked = stake_pool.total_staked.checked_add(1).expect("Add error");
         Ok(())
@@ -110,19 +107,6 @@ mod dyme_staking {
         let payer = &ctx.accounts.payer.key();
         let stake_mint = &ctx.accounts.stake_mint.key();
 
-        let decimals_str = format!(
-            "1{}",
-            "0".repeat(stake_pool.default_multiplier.try_into().unwrap())
-        ); // Concatenating "1" with "0" repeated `number` times
-        let decimals: u64 = decimals_str.parse().expect("Failed to parse string to u64");
-
-        let accounts = TransferChecked {
-            from: ctx.accounts.entry_token_account.to_account_info(),
-            to: ctx.accounts.payer_token_account.to_account_info(),
-            authority: stake_entry.to_account_info(),
-            mint: ctx.accounts.stake_mint.to_account_info(),
-        };
-
         let seeds = &[
             STAKE_ENTRY_PREFIX.as_bytes(),
             pool.as_ref(),
@@ -133,20 +117,100 @@ mod dyme_staking {
 
         let signer_seeds = &[&seeds[..]];
 
-        let ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            accounts,
-            signer_seeds,
-        );
+        if stake_entry.min_stake_seconds.is_some()
+            && stake_entry.min_stake_seconds.unwrap() > 0
+            && ((Clock::get().unwrap().unix_timestamp - stake_entry.last_staked_at) as u32)
+                < stake_entry.min_stake_seconds.unwrap()
+        {
+            let deduction = ix.amount * 30 / 100;
+            let remaining_amount = ix.amount - deduction;
 
-        transfer_checked(
-            ctx,
-            ix.amount * decimals,
-            stake_pool.default_multiplier as u8,
-        )?;
+            let deduction_accounts = TransferChecked {
+                from: ctx.accounts.entry_token_account.to_account_info(),
+                to: ctx.accounts.pool_token_account.to_account_info(),
+                authority: stake_entry.to_account_info(),
+                mint: ctx.accounts.stake_mint.to_account_info(),
+            };
+
+            let deduction_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                deduction_accounts,
+                signer_seeds,
+            );
+
+            transfer_checked(
+                deduction_ctx,
+                deduction,
+                stake_pool.default_multiplier as u8,
+            )?;
+
+            let accounts = TransferChecked {
+                from: ctx.accounts.entry_token_account.to_account_info(),
+                to: ctx.accounts.payer_token_account.to_account_info(),
+                authority: stake_entry.to_account_info(),
+                mint: ctx.accounts.stake_mint.to_account_info(),
+            };
+
+            let ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                accounts,
+                signer_seeds,
+            );
+
+            transfer_checked(ctx, remaining_amount, stake_pool.default_multiplier as u8)?;
+        } else {
+            let pool_apr_amount = ix.amount * stake_pool.apr / 10000;
+            let stake_apr_amount = pool_apr_amount * stake_entry.apr / 10000;
+
+            msg!("Stake pr amount : {}", stake_apr_amount);
+
+            let pool_seeds = &[
+                STAKE_POOL_PREFIX.as_bytes(),
+                stake_pool.identifier.as_ref(),
+                &[stake_pool.bump],
+            ];
+
+            let pool_signer_seeds = &[&pool_seeds[..]];
+
+            let pool_accounts = TransferChecked {
+                from: ctx.accounts.pool_token_account.to_account_info(),
+                to: ctx.accounts.payer_token_account.to_account_info(),
+                authority: stake_pool.to_account_info(),
+                mint: ctx.accounts.stake_mint.to_account_info(),
+            };
+
+            let pool_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                pool_accounts,
+                pool_signer_seeds,
+            );
+
+            transfer_checked(
+                pool_ctx,
+                stake_apr_amount,
+                stake_pool.default_multiplier as u8,
+            )?;
+
+            let accounts = TransferChecked {
+                from: ctx.accounts.entry_token_account.to_account_info(),
+                to: ctx.accounts.payer_token_account.to_account_info(),
+                authority: stake_entry.to_account_info(),
+                mint: ctx.accounts.stake_mint.to_account_info(),
+            };
+
+            let ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                accounts,
+                signer_seeds,
+            );
+
+            transfer_checked(ctx, ix.amount, stake_pool.default_multiplier as u8)?;
+        }
 
         stake_entry.amount = stake_entry.amount - ix.amount;
-        stake_pool.total_staked = stake_pool.total_staked.checked_sub(1).expect("Sub error");
+        if stake_entry.amount <= 0 {
+            stake_pool.total_staked = stake_pool.total_staked.checked_sub(1).expect("Sub error");
+        }
         Ok(())
     }
 
@@ -201,7 +265,7 @@ pub struct InitEntryCtx<'info> {
     #[account(
         init,
         payer = payer,
-        space = 126,
+        space = 134,
         seeds = [STAKE_ENTRY_PREFIX.as_bytes(), stake_pool.key().as_ref(), stake_mint.key().as_ref(), payer.key().as_ref()],
         bump,
     )]
@@ -255,6 +319,8 @@ pub struct UnstakeCtx<'info> {
     stake_pool: Box<Account<'info, StakePool>>,
     #[account(mut)]
     entry_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pool_token_account: Account<'info, TokenAccount>,
     stake_mint: Box<Account<'info, Mint>>,
     #[account(mut)]
     payer_token_account: Account<'info, TokenAccount>,
@@ -269,7 +335,6 @@ pub struct StakePool {
     pub bump: u8,
     pub authority: Pubkey,
     pub total_staked: u32,
-    // pub min_stake_seconds: Option<u32>,
     pub token_address: Pubkey,
     pub apr: u64,
     pub end_date: Option<i64>,
@@ -283,7 +348,6 @@ pub struct StakePool {
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct InitPoolIx {
     authority: Pubkey,
-    // min_stake_seconds: Option<u32>,
     token_address: Pubkey,
     apr: u64,
     is_active: bool,
@@ -303,12 +367,14 @@ pub struct StakeEntry {
     pub last_staker: Pubkey,
     pub last_staked_at: i64,
     pub min_stake_seconds: Option<u32>,
+    pub apr: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct InitStakeIx {
-    pub amount: u64,
-    pub min_stake_seconds: Option<u32>,
+    amount: u64,
+    min_stake_seconds: Option<u32>,
+    apr: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
