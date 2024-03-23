@@ -4,6 +4,7 @@ use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 use anchor_spl::token_interface::{transfer_checked, TransferChecked};
 use crate::utils::resize_account;
+use solana_program::{pubkey, pubkey::Pubkey};
 mod errors;
 
 // This is your program's public key and it will update
@@ -13,6 +14,7 @@ declare_id!("6rbcJVHa32dKfw8kF1F1quSravjCLxpcjyuEqw7rP2Gc");
 pub const STAKE_POOL_PREFIX: &str = "stake-pool";
 pub const STAKE_POOL_DEFAULT_SIZE: usize = 8 + 1 + 32 + 16 + 16 + 32 + 16 + 16 + 32 + 1 + 24 + 24;
 pub const STAKE_ENTRY_PREFIX: &str = "stake-entry";
+pub const SUPER_ADMIN: Pubkey = pubkey!("Bx6Z6XxCSdwtqmiKP9prwU7m8NDuUcA11FtPdSZ5Fw9B");
 
 #[program]
 mod dyme_staking {
@@ -33,6 +35,14 @@ mod dyme_staking {
             is_active: true,
             identifier,
         };
+
+        if (Some(ctx.accounts.mint.mint_authority).is_some()
+            && (ctx.accounts.mint.mint_authority
+                != solana_program::program_option::COption::Some(ctx.accounts.payer.key())))
+            || (ctx.accounts.payer.key() == SUPER_ADMIN)
+        {
+            return err!(errors::ErrorCode::InvalidTokenAuthority);
+        }
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.payer_token_account.to_account_info(),
@@ -71,15 +81,26 @@ mod dyme_staking {
     pub fn stake_token(ctx: Context<InitStakeCtx>, ix: InitStakeIx) -> Result<()> {
         let stake_entry = &mut ctx.accounts.stake_entry;
         let stake_pool = &mut ctx.accounts.stake_pool;
+
+        if !stake_pool.is_active {
+            return err!(errors::ErrorCode::PoolFrozen);
+        }
+
         if stake_pool.end_date.is_some()
             && Clock::get().unwrap().unix_timestamp > stake_pool.end_date.unwrap()
         {
-            return Err(errors::ErrorCode::StakePoolHasEnded.into());
+            return err!(errors::ErrorCode::StakePoolHasEnded);
         }
 
         if stake_entry.amount > 0 {
-            return Err(errors::ErrorCode::UnstakeAllTokens.into());
+            return err!(errors::ErrorCode::UnstakeAllTokens);
         }
+
+        // let decimals_str = format!(
+        //     "1{}",
+        //     "0".repeat(stake_pool.default_multiplier.try_into().unwrap())
+        // ); // Concatenating "1" with "0" repeated `number` times
+        // let decimals: u64 = decimals_str.parse().expect("Failed to parse string to u64");
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.payer_token_account.to_account_info(),
@@ -106,6 +127,10 @@ mod dyme_staking {
         let stake_pool = &mut ctx.accounts.stake_pool;
         let payer = &ctx.accounts.payer.key();
         let stake_mint = &ctx.accounts.stake_mint.key();
+
+        if !stake_pool.is_active {
+            return err!(errors::ErrorCode::PoolFrozen);
+        }
 
         let seeds = &[
             STAKE_ENTRY_PREFIX.as_bytes(),
@@ -214,6 +239,18 @@ mod dyme_staking {
         Ok(())
     }
 
+    pub fn freeze_pool(ctx: Context<FreezePoolCtx>) -> Result<()> {
+        let stake_pool = &mut ctx.accounts.stake_pool;
+        stake_pool.is_active = false;
+        Ok(())
+    }
+
+    pub fn unfreeze_pool(ctx: Context<UnfreezePoolCtx>) -> Result<()> {
+        let stake_pool = &mut ctx.accounts.stake_pool;
+        stake_pool.is_active = true;
+        Ok(())
+    }
+
     // pub fn update_pool(ctx: Context<UpdatePoolCtx>, ix: UpdatePoolIx) -> Result<()> {
     //     let stake_pool = &mut ctx.accounts.stake_pool;
     //     stake_pool.min_stake_seconds = ix.min_stake_seconds;
@@ -235,11 +272,13 @@ pub struct InitPoolCtx<'info> {
     #[account(
         init_if_needed,
         payer = payer, 
-        associated_token::mint = token_address, 
+        associated_token::mint = mint, 
         associated_token::authority = stake_pool
     )]
     pool_token_account: Account<'info, TokenAccount>,
-    token_address: Account<'info, Mint>,
+
+    // #[account(mint::authority=payer)]
+    mint: Account<'info, Mint>,
 
     #[account(mut)]
     payer_token_account: Account<'info, TokenAccount>,
@@ -298,14 +337,31 @@ pub struct InitStakeCtx<'info> {
     #[account(mut)]
     entry_token_account: Account<'info, TokenAccount>,
 
-    stake_mint: Box<Account<'info, Mint>>,
-
     #[account(mut)]
     payer_token_account: Account<'info, TokenAccount>,
     token_program: Program<'info, Token>,
     associated_token_program: Program<'info, AssociatedToken>,
     rent: Sysvar<'info, Rent>,
 
+    #[account(mut)]
+    payer: Signer<'info>,
+    stake_mint: Account<'info, Mint>,
+    system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FreezePoolCtx<'info> {
+    #[account(mut, constraint = stake_pool.authority==payer.key() || payer.key()==SUPER_ADMIN @ errors::ErrorCode::InvalidAdmin)]
+    stake_pool: Account<'info, StakePool>,
+    #[account(mut)]
+    payer: Signer<'info>,
+    system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UnfreezePoolCtx<'info> {
+    #[account(mut, constraint = stake_pool.authority==payer.key() || payer.key()==SUPER_ADMIN @ errors::ErrorCode::InvalidAdmin)]
+    stake_pool: Account<'info, StakePool>,
     #[account(mut)]
     payer: Signer<'info>,
     system_program: Program<'info, System>,
