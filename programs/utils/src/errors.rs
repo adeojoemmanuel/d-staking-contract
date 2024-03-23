@@ -6,4 +6,10 @@ pub enum ErrorCode {
     StakePoolHasEnded,
     #[msg("Please unstake all tokens before staking")]
     UnstakeAllTokens,
+    #[msg("Pool is frozen")]
+    PoolFrozen,
+    #[msg("Invalid Pool Admin")]
+    InvalidAdmin,
+    #[msg("Invalid Token Authority")]
+    InvalidTokenAuthority,
 }
