@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
 pub mod utils;
+use anchor_lang::system_program;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 use anchor_spl::token_interface::{transfer_checked, TransferChecked};
@@ -15,6 +16,7 @@ pub const STAKE_POOL_PREFIX: &str = "stake-pool";
 pub const STAKE_POOL_DEFAULT_SIZE: usize = 8 + 1 + 32 + 16 + 16 + 32 + 16 + 16 + 32 + 1 + 24 + 24;
 pub const STAKE_ENTRY_PREFIX: &str = "stake-entry";
 pub const SUPER_ADMIN: Pubkey = pubkey!("Bx6Z6XxCSdwtqmiKP9prwU7m8NDuUcA11FtPdSZ5Fw9B");
+pub const PLATFORM_FEE: u64 = 500000000; // 0.5 SOL
 
 #[program]
 mod dyme_staking {
@@ -36,12 +38,15 @@ mod dyme_staking {
             identifier,
         };
 
-        if (Some(ctx.accounts.mint.mint_authority).is_some()
+        msg!("account, {:?}", ctx.accounts.mint);
+
+        if Some(ctx.accounts.mint.mint_authority).is_some()
             && (ctx.accounts.mint.mint_authority
-                != solana_program::program_option::COption::Some(ctx.accounts.payer.key())))
-            || (ctx.accounts.payer.key() == SUPER_ADMIN)
+                != solana_program::program_option::COption::Some(ctx.accounts.payer.key()))
         {
-            return err!(errors::ErrorCode::InvalidTokenAuthority);
+            if ctx.accounts.payer.key() != SUPER_ADMIN {
+                return err!(errors::ErrorCode::InvalidTokenAuthority);
+            }
         }
 
         let cpi_accounts = Transfer {
@@ -53,6 +58,15 @@ mod dyme_staking {
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
 
         token::transfer(cpi_ctx, ix.amount)?;
+
+        let cpi_context = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            system_program::Transfer {
+                from: ctx.accounts.payer.to_account_info(),
+                to: ctx.accounts.super_admin.to_account_info(),
+            },
+        );
+        system_program::transfer(cpi_context, PLATFORM_FEE)?;
 
         let stake_pool = &mut ctx.accounts.stake_pool;
         let new_space = new_stake_pool.try_to_vec()?.len() + 8;
@@ -187,8 +201,6 @@ mod dyme_staking {
             let pool_apr_amount = ix.amount * stake_pool.apr / 10000;
             let stake_apr_amount = pool_apr_amount * stake_entry.apr / 10000;
 
-            msg!("Stake pr amount : {}", stake_apr_amount);
-
             let pool_seeds = &[
                 STAKE_POOL_PREFIX.as_bytes(),
                 stake_pool.identifier.as_ref(),
@@ -239,6 +251,58 @@ mod dyme_staking {
         Ok(())
     }
 
+    pub fn claim_token(ctx: Context<UnstakeCtx>, ix: UnstakeIx) -> Result<()> {
+        let stake_entry = &mut ctx.accounts.stake_entry;
+        let stake_pool = &mut ctx.accounts.stake_pool;
+
+        if !stake_pool.is_active {
+            return err!(errors::ErrorCode::PoolFrozen);
+        }
+
+        if stake_entry.min_stake_seconds.is_some()
+            && stake_entry.min_stake_seconds.unwrap() > 0
+            && ((Clock::get().unwrap().unix_timestamp - stake_entry.last_staked_at) as u32)
+                < stake_entry.min_stake_seconds.unwrap()
+        {
+            return err!(errors::ErrorCode::MinStakeSecondsNotSatisfied);
+        }
+        let pool_apr_amount = ix.amount * stake_pool.apr / 10000;
+        let stake_apr_amount = pool_apr_amount * stake_entry.apr / 10000;
+
+        let pool_seeds = &[
+            STAKE_POOL_PREFIX.as_bytes(),
+            stake_pool.identifier.as_ref(),
+            &[stake_pool.bump],
+        ];
+
+        let pool_signer_seeds = &[&pool_seeds[..]];
+
+        let pool_accounts = TransferChecked {
+            from: ctx.accounts.pool_token_account.to_account_info(),
+            to: ctx.accounts.payer_token_account.to_account_info(),
+            authority: stake_pool.to_account_info(),
+            mint: ctx.accounts.stake_mint.to_account_info(),
+        };
+
+        let pool_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            pool_accounts,
+            pool_signer_seeds,
+        );
+
+        transfer_checked(
+            pool_ctx,
+            stake_apr_amount,
+            stake_pool.default_multiplier as u8,
+        )?;
+
+        stake_entry.amount = stake_entry.amount - ix.amount;
+        if stake_entry.amount <= 0 {
+            stake_pool.total_staked = stake_pool.total_staked.checked_sub(1).expect("Sub error");
+        }
+        Ok(())
+    }
+
     pub fn freeze_pool(ctx: Context<FreezePoolCtx>) -> Result<()> {
         let stake_pool = &mut ctx.accounts.stake_pool;
         stake_pool.is_active = false;
@@ -276,9 +340,10 @@ pub struct InitPoolCtx<'info> {
         associated_token::authority = stake_pool
     )]
     pool_token_account: Account<'info, TokenAccount>,
-
-    // #[account(mint::authority=payer)]
     mint: Account<'info, Mint>,
+
+    #[account(mut, constraint = super_admin.key() == SUPER_ADMIN @ errors::ErrorCode::InvalidSuperAdmin)]
+    super_admin: UncheckedAccount<'info>,
 
     #[account(mut)]
     payer_token_account: Account<'info, TokenAccount>,
@@ -350,6 +415,44 @@ pub struct InitStakeCtx<'info> {
 }
 
 #[derive(Accounts)]
+pub struct UnstakeCtx<'info> {
+    #[account(mut, constraint = stake_entry.last_staker == payer.key() @ errors::ErrorCode::InvalidStaker)]
+    stake_entry: Box<Account<'info, StakeEntry>>,
+    #[account(mut)]
+    stake_pool: Box<Account<'info, StakePool>>,
+    #[account(mut)]
+    entry_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pool_token_account: Account<'info, TokenAccount>,
+    stake_mint: Box<Account<'info, Mint>>,
+    #[account(mut)]
+    payer_token_account: Account<'info, TokenAccount>,
+    token_program: Program<'info, Token>,
+    #[account(mut)]
+    payer: Signer<'info>,
+    system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimCtx<'info> {
+    #[account(mut, constraint = stake_entry.last_staker == payer.key() @ errors::ErrorCode::InvalidStaker)]
+    stake_entry: Box<Account<'info, StakeEntry>>,
+    #[account(mut)]
+    stake_pool: Box<Account<'info, StakePool>>,
+    #[account(mut)]
+    entry_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pool_token_account: Account<'info, TokenAccount>,
+    stake_mint: Box<Account<'info, Mint>>,
+    #[account(mut)]
+    payer_token_account: Account<'info, TokenAccount>,
+    token_program: Program<'info, Token>,
+    #[account(mut)]
+    payer: Signer<'info>,
+    system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct FreezePoolCtx<'info> {
     #[account(mut, constraint = stake_pool.authority==payer.key() || payer.key()==SUPER_ADMIN @ errors::ErrorCode::InvalidAdmin)]
     stake_pool: Account<'info, StakePool>,
@@ -362,25 +465,6 @@ pub struct FreezePoolCtx<'info> {
 pub struct UnfreezePoolCtx<'info> {
     #[account(mut, constraint = stake_pool.authority==payer.key() || payer.key()==SUPER_ADMIN @ errors::ErrorCode::InvalidAdmin)]
     stake_pool: Account<'info, StakePool>,
-    #[account(mut)]
-    payer: Signer<'info>,
-    system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct UnstakeCtx<'info> {
-    #[account(mut)]
-    stake_entry: Box<Account<'info, StakeEntry>>,
-    #[account(mut)]
-    stake_pool: Box<Account<'info, StakePool>>,
-    #[account(mut)]
-    entry_token_account: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pool_token_account: Account<'info, TokenAccount>,
-    stake_mint: Box<Account<'info, Mint>>,
-    #[account(mut)]
-    payer_token_account: Account<'info, TokenAccount>,
-    token_program: Program<'info, Token>,
     #[account(mut)]
     payer: Signer<'info>,
     system_program: Program<'info, System>,

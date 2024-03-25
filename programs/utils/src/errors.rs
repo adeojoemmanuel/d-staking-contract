@@ -10,6 +10,12 @@ pub enum ErrorCode {
     PoolFrozen,
     #[msg("Invalid Pool Admin")]
     InvalidAdmin,
+    #[msg("Invalid Super Admin")]
+    InvalidSuperAdmin,
     #[msg("Invalid Token Authority")]
     InvalidTokenAuthority,
+    #[msg("Minimum stake seconds not satisfied")]
+    MinStakeSecondsNotSatisfied,
+    #[msg("Invalid Staker")]
+    InvalidStaker,
 }
