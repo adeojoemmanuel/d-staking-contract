@@ -10,7 +10,7 @@ mod errors;
 
 // This is your program's public key and it will update
 // automatically when you build the project.
-declare_id!("6rbcJVHa32dKfw8kF1F1quSravjCLxpcjyuEqw7rP2Gc");
+declare_id!("13cmrtqpPfd4nMor9P6HeboFM7JpQPX3nLPBSQeeVTSj");
 
 pub const STAKE_POOL_PREFIX: &str = "stake-pool";
 pub const STAKE_POOL_DEFAULT_SIZE: usize = 8 + 1 + 32 + 16 + 16 + 32 + 16 + 16 + 32 + 1 + 24 + 24;
@@ -28,6 +28,7 @@ mod dyme_staking {
             bump,
             authority: ix.authority,
             total_staked: 0,
+            total_stakers: 0,
             token_address: ix.token_address,
             apr: ix.apr,
             end_date: ix.end_date,
@@ -110,12 +111,6 @@ mod dyme_staking {
             return err!(errors::ErrorCode::UnstakeAllTokens);
         }
 
-        // let decimals_str = format!(
-        //     "1{}",
-        //     "0".repeat(stake_pool.default_multiplier.try_into().unwrap())
-        // ); // Concatenating "1" with "0" repeated `number` times
-        // let decimals: u64 = decimals_str.parse().expect("Failed to parse string to u64");
-
         let cpi_accounts = Transfer {
             from: ctx.accounts.payer_token_account.to_account_info(),
             to: ctx.accounts.entry_token_account.to_account_info(),
@@ -131,7 +126,8 @@ mod dyme_staking {
         stake_entry.last_staked_at = Clock::get().unwrap().unix_timestamp;
         stake_entry.amount = stake_entry.amount.checked_add(ix.amount).unwrap();
         stake_entry.min_stake_seconds = ix.min_stake_seconds;
-        stake_pool.total_staked = stake_pool.total_staked.checked_add(1).expect("Add error");
+        stake_pool.total_staked = stake_pool.total_staked + ix.amount;
+        stake_pool.total_stakers = stake_pool.total_stakers.checked_add(1).expect("Add error");
         Ok(())
     }
 
@@ -164,9 +160,13 @@ mod dyme_staking {
             let deduction = ix.amount * 30 / 100;
             let remaining_amount = ix.amount - deduction;
 
+            let two_percent = deduction * 2 / 100;
+            let remaining_penalty = deduction - two_percent;
+
+            // Transfer to super admin 2%
             let deduction_accounts = TransferChecked {
                 from: ctx.accounts.entry_token_account.to_account_info(),
-                to: ctx.accounts.pool_token_account.to_account_info(),
+                to: ctx.accounts.super_admin_token_account.to_account_info(),
                 authority: stake_entry.to_account_info(),
                 mint: ctx.accounts.stake_mint.to_account_info(),
             };
@@ -179,10 +179,31 @@ mod dyme_staking {
 
             transfer_checked(
                 deduction_ctx,
-                deduction,
+                two_percent,
                 stake_pool.default_multiplier as u8,
             )?;
 
+            // Transfer to pool owner 98%
+            let pool_owner_transfer = TransferChecked {
+                from: ctx.accounts.entry_token_account.to_account_info(),
+                to: ctx.accounts.pool_owner_token_account.to_account_info(),
+                authority: stake_entry.to_account_info(),
+                mint: ctx.accounts.stake_mint.to_account_info(),
+            };
+
+            let pool_owner_transfer_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                pool_owner_transfer,
+                signer_seeds,
+            );
+
+            transfer_checked(
+                pool_owner_transfer_ctx,
+                remaining_penalty,
+                stake_pool.default_multiplier as u8,
+            )?;
+
+            // Transfer to staker after deduction
             let accounts = TransferChecked {
                 from: ctx.accounts.entry_token_account.to_account_info(),
                 to: ctx.accounts.payer_token_account.to_account_info(),
@@ -245,8 +266,9 @@ mod dyme_staking {
         }
 
         stake_entry.amount = stake_entry.amount - ix.amount;
+        stake_pool.total_staked = stake_pool.total_staked + ix.amount;
         if stake_entry.amount <= 0 {
-            stake_pool.total_staked = stake_pool.total_staked.checked_sub(1).expect("Sub error");
+            stake_pool.total_stakers = stake_pool.total_stakers.checked_sub(1).expect("Sub error");
         }
         Ok(())
     }
@@ -315,11 +337,6 @@ mod dyme_staking {
         Ok(())
     }
 
-    // pub fn update_pool(ctx: Context<UpdatePoolCtx>, ix: UpdatePoolIx) -> Result<()> {
-    //     let stake_pool = &mut ctx.accounts.stake_pool;
-    //     stake_pool.min_stake_seconds = ix.min_stake_seconds;
-    //     Ok(())
-    // }
 }
 
 #[derive(Accounts)]
@@ -427,6 +444,11 @@ pub struct UnstakeCtx<'info> {
     stake_mint: Box<Account<'info, Mint>>,
     #[account(mut)]
     payer_token_account: Account<'info, TokenAccount>,
+    super_admin: UncheckedAccount<'info>,
+    #[account(mut)]
+    super_admin_token_account: Account<'info, TokenAccount>,
+    #[account(mut, associated_token::mint = stake_mint,  associated_token::authority = stake_pool.authority)]
+    pool_owner_token_account: Account<'info, TokenAccount>,
     token_program: Program<'info, Token>,
     #[account(mut)]
     payer: Signer<'info>,
@@ -474,7 +496,8 @@ pub struct UnfreezePoolCtx<'info> {
 pub struct StakePool {
     pub bump: u8,
     pub authority: Pubkey,
-    pub total_staked: u32,
+    pub total_staked: u64,
+    pub total_stakers: u32,
     pub token_address: Pubkey,
     pub apr: u64,
     pub end_date: Option<i64>,
