@@ -219,6 +219,9 @@ mod dyme_staking {
 
             transfer_checked(ctx, remaining_amount, stake_pool.default_multiplier as u8)?;
         } else {
+            let unstake_fee = ix.amount * 1 / 100;
+            let unstake_amount = ix.amount - unstake_fee;
+
             let pool_apr_amount = ix.amount * stake_pool.apr / 10000;
             let stake_apr_amount = pool_apr_amount * stake_entry.apr / 10000;
 
@@ -249,6 +252,25 @@ mod dyme_staking {
                 stake_pool.default_multiplier as u8,
             )?;
 
+            let unstake_fee_accounts = TransferChecked {
+                from: ctx.accounts.entry_token_account.to_account_info(),
+                to: ctx.accounts.pool_owner_token_account.to_account_info(),
+                authority: stake_entry.to_account_info(),
+                mint: ctx.accounts.stake_mint.to_account_info(),
+            };
+
+            let unstake_fee_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                unstake_fee_accounts,
+                signer_seeds,
+            );
+
+            transfer_checked(
+                unstake_fee_ctx,
+                unstake_fee,
+                stake_pool.default_multiplier as u8,
+            )?;
+
             let accounts = TransferChecked {
                 from: ctx.accounts.entry_token_account.to_account_info(),
                 to: ctx.accounts.payer_token_account.to_account_info(),
@@ -262,7 +284,7 @@ mod dyme_staking {
                 signer_seeds,
             );
 
-            transfer_checked(ctx, ix.amount, stake_pool.default_multiplier as u8)?;
+            transfer_checked(ctx, unstake_amount, stake_pool.default_multiplier as u8)?;
         }
 
         stake_entry.amount = stake_entry.amount - ix.amount;
@@ -273,7 +295,7 @@ mod dyme_staking {
         Ok(())
     }
 
-    pub fn claim_token(ctx: Context<UnstakeCtx>, ix: UnstakeIx) -> Result<()> {
+    pub fn claim_token(ctx: Context<ClaimCtx>, ix: UnstakeIx) -> Result<()> {
         let stake_entry = &mut ctx.accounts.stake_entry;
         let stake_pool = &mut ctx.accounts.stake_pool;
 
@@ -318,10 +340,7 @@ mod dyme_staking {
             stake_pool.default_multiplier as u8,
         )?;
 
-        stake_entry.amount = stake_entry.amount - ix.amount;
-        if stake_entry.amount <= 0 {
-            stake_pool.total_staked = stake_pool.total_staked.checked_sub(1).expect("Sub error");
-        }
+        stake_entry.last_staked_at = Clock::get().unwrap().unix_timestamp;
         Ok(())
     }
 
