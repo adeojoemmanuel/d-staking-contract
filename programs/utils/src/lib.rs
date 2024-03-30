@@ -142,6 +142,10 @@ mod dyme_staking {
             return err!(errors::ErrorCode::PoolFrozen);
         }
 
+        if stake_entry.amount <= 0 {
+            return err!(errors::ErrorCode::NoTokenStaked);
+        }
+
         let seeds = &[
             STAKE_ENTRY_PREFIX.as_bytes(),
             pool.as_ref(),
@@ -288,7 +292,7 @@ mod dyme_staking {
         }
 
         stake_entry.amount = stake_entry.amount - ix.amount;
-        stake_pool.total_staked = stake_pool.total_staked + ix.amount;
+        stake_pool.total_staked = stake_pool.total_staked - ix.amount;
         if stake_entry.amount <= 0 {
             stake_pool.total_stakers = stake_pool.total_stakers.checked_sub(1).expect("Sub error");
         }
@@ -301,6 +305,10 @@ mod dyme_staking {
 
         if !stake_pool.is_active {
             return err!(errors::ErrorCode::PoolFrozen);
+        }
+
+        if stake_entry.amount <= 0 {
+            return err!(errors::ErrorCode::NoTokenStaked);
         }
 
         if stake_entry.min_stake_seconds.is_some()

@@ -18,4 +18,6 @@ pub enum ErrorCode {
     MinStakeSecondsNotSatisfied,
     #[msg("Invalid Staker")]
     InvalidStaker,
+    #[msg("No Tokens Staked")]
+    NoTokenStaked,
 }
