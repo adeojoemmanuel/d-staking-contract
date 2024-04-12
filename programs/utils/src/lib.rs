@@ -138,9 +138,9 @@ mod dyme_staking {
         let payer = &ctx.accounts.payer.key();
         let stake_mint = &ctx.accounts.stake_mint.key();
 
-        if !stake_pool.is_active {
-            return err!(errors::ErrorCode::PoolFrozen);
-        }
+        // if !stake_pool.is_active {
+        //     return err!(errors::ErrorCode::PoolFrozen);
+        // }
 
         if stake_entry.amount <= 0 {
             return err!(errors::ErrorCode::NoTokenStaked);
@@ -156,7 +156,8 @@ mod dyme_staking {
 
         let signer_seeds = &[&seeds[..]];
 
-        if stake_entry.min_stake_seconds.is_some()
+        if stake_pool.is_active == true
+            && stake_entry.min_stake_seconds.is_some()
             && stake_entry.min_stake_seconds.unwrap() > 0
             && ((Clock::get().unwrap().unix_timestamp - stake_entry.last_staked_at) as u32)
                 < stake_entry.min_stake_seconds.unwrap()
@@ -224,9 +225,35 @@ mod dyme_staking {
             transfer_checked(ctx, remaining_amount, stake_pool.default_multiplier as u8)?;
         } else {
             let unstake_fee = ix.amount * 1 / 100;
-            let unstake_amount = ix.amount - unstake_fee;
+            let amount = ix.amount - unstake_fee;
+            let mut unstake_amount: u64 = 0;
 
-            let pool_apr_amount = ix.amount * stake_pool.apr / 10000;
+            // 2% on freeze transfer
+            if stake_pool.is_active == false {
+                let deduction = unstake_fee * 30 / 100;
+                let two_percent = deduction * 2 / 100;
+
+                unstake_amount = amount - two_percent;
+
+                let freeze_accounts = TransferChecked {
+                    from: ctx.accounts.entry_token_account.to_account_info(),
+                    to: ctx.accounts.super_admin_token_account.to_account_info(),
+                    authority: stake_entry.to_account_info(),
+                    mint: ctx.accounts.stake_mint.to_account_info(),
+                };
+
+                let freeze_ctx = CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    freeze_accounts,
+                    signer_seeds,
+                );
+
+                transfer_checked(freeze_ctx, two_percent, stake_pool.default_multiplier as u8)?;
+            } else {
+                unstake_amount = ix.amount - unstake_fee;
+            }
+
+            let pool_apr_amount = unstake_amount * stake_pool.apr / 10000;
             let stake_apr_amount = pool_apr_amount * stake_entry.apr / 10000;
 
             let pool_seeds = &[
